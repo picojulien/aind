@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Julien Sagot
+# SPDX-License-Identifier: MIT
 #
 # aind — Run AI coding tools inside a persistent Docker container.
 #
