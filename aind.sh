@@ -70,6 +70,8 @@
 #                     subdirectory while keeping this mount as the workspace root.
 #                     Linked git worktrees may also mount their external .git
 #                     metadata read-write so Git/OpenCode can identify the repo.
+#   --ro-mount <path> — user-specified existing host paths mounted read-only at
+#                     the same resolved absolute path inside the container.
 #
 # Network: the container has unrestricted outbound internet access, so any of
 # the data listed above can be exfiltrated by a malicious tool or dependency.
@@ -175,18 +177,44 @@ container_name() {
   echo "${CONTAINER_PREFIX}${workspace}" | tr '/' '-'
 }
 
-# Parse mode flag, optional --cwd/-cwd, and optional workspace path from arguments.
-# Sets PARSED_MODE, PARSED_CWD, and PARSED_WORKSPACE.
+# Add one validated, resolved read-only host path mount unless it was already
+# requested. The same resolved path is used as the container destination.
+add_ro_mount_path() {
+  local path="${1:-}" resolved existing
+  [[ -n "$path" ]] || err "--ro-mount requires a non-empty path."
+  [[ -e "$path" ]] || err "Read-only mount path does not exist: $path"
+  resolved="$(resolve_path "$path")"
+  [[ -e "$resolved" ]] || err "Read-only mount path does not exist after resolving: $path"
+
+  for existing in "${PARSED_RO_MOUNTS[@]}"; do
+    [[ "$existing" == "$resolved" ]] && return 0
+  done
+  PARSED_RO_MOUNTS+=("$resolved")
+}
+
+# Parse mode flag, optional --cwd/-cwd, repeatable --ro-mount, and optional
+# workspace path from arguments.
+# Sets PARSED_MODE, PARSED_CWD, PARSED_WORKSPACE, and PARSED_RO_MOUNTS.
 parse_args() {
   PARSED_MODE="claude"
   PARSED_CWD=""
   PARSED_WORKSPACE=""
+  PARSED_RO_MOUNTS=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --copilot) PARSED_MODE="copilot"; shift ;;
       --gemini)  PARSED_MODE="gemini"; shift ;;
       --opencode) PARSED_MODE="opencode"; shift ;;
+      --ro-mount)
+        [[ $# -ge 2 ]] || err "--ro-mount requires a non-empty path."
+        add_ro_mount_path "$2"
+        shift 2
+        ;;
+      --ro-mount=*)
+        add_ro_mount_path "${1#*=}"
+        shift
+        ;;
       --cwd|-cwd)
         [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != -* ]] \
           || err "--cwd/-cwd requires a relative OpenCode start subdirectory."
@@ -565,6 +593,22 @@ ensure_opencode_mounts() {
 
   if [[ ${#missing[@]} -gt 0 ]]; then
     err "Container '$cname' is missing or has invalid OpenCode bind mount(s): ${missing[*]}. Remove and recreate it with: aind rm --opencode '$workspace' && aind start --opencode '$workspace'"
+  fi
+}
+
+# Existing containers cannot be modified to add Docker bind mounts. If the user
+# requested extra read-only mounts, verify that an existing container already has
+# matching read-only bind mounts from and to each resolved path.
+ensure_requested_ro_mounts() {
+  local cname="$1" workspace="$2" mount missing=()
+
+  for mount in "${PARSED_RO_MOUNTS[@]}"; do
+    container_has_readonly_bind_mount_from "$cname" "$mount" "$mount" \
+      || missing+=("$mount")
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Container '$cname' is missing requested read-only bind mount(s): ${missing[*]}. Existing containers cannot gain mounts. Remove and recreate it with: aind rm '$workspace' && aind start --ro-mount PATH '$workspace'"
   fi
 }
 
@@ -1037,6 +1081,7 @@ cmd_start() {
     if [[ "$mode" == "opencode" ]]; then
       ensure_opencode_mounts "$cname" "$workspace" "$start_dir"
     fi
+    ensure_requested_ro_mounts "$cname" "$workspace"
     exists=true
   fi
 
@@ -1056,8 +1101,11 @@ cmd_start() {
     #   gemini:  ~/.gemini
     #   opencode: ~/.config/opencode, ~/.local/share/opencode, and
     #     AIND's shared OpenCode config mounted read-only under /etc/opencode.
-    local config_mounts=()
+    local config_mounts=() ro_mounts=() ro_mount
     local git_metadata_mounts=() git_metadata_mount
+    for ro_mount in "${PARSED_RO_MOUNTS[@]}"; do
+      ro_mounts+=( -v "$ro_mount:$ro_mount:ro" )
+    done
     case "$mode" in
       copilot)
         config_mounts=(
@@ -1102,6 +1150,7 @@ cmd_start() {
     # GIT_*: set the git identity for all commits made by the AI tool.
     # GH_TOKEN/GITLAB_TOKEN: injected at exec time (not run time) so a
     #   stop/start cycle picks up updated token files without needing docker rm.
+    # read-only extra mounts: --ro-mount paths use source=destination and :ro.
     # workspace mount: uses the exact host path so paths match on both sides.
     # aind.mode label: detects accidental reuse of a workspace container with
     #   a different AI tool mode on future runs.
@@ -1133,6 +1182,7 @@ cmd_start() {
       -e GIT_COMMITTER_NAME="$(case "$mode" in copilot) echo 'GitHub Copilot';; gemini) echo 'Gemini CLI';; opencode) echo 'OpenCode';; *) echo 'Claude Code';; esac)" \
       -e GIT_COMMITTER_EMAIL="$(case "$mode" in copilot) echo 'noreply@github.com';; gemini) echo 'noreply@google.com';; opencode) echo 'noreply@opencode.ai';; *) echo 'noreply@anthropic.com';; esac)" \
       "${config_mounts[@]}" \
+      "${ro_mounts[@]}" \
       "${git_metadata_mounts[@]}" \
       -v "$workspace:$workspace" \
       --workdir "$workspace" \
@@ -1318,10 +1368,18 @@ cmd_logs() {
 
 cmd_restart() {
   parse_args "$@"
+  local workspace
+  workspace="$(resolve_path "${PARSED_WORKSPACE:-$PWD}")"
   if [[ "$PARSED_MODE" == "opencode" ]]; then
-    local workspace
-    workspace="$(resolve_path "${PARSED_WORKSPACE:-$PWD}")"
     validate_opencode_start_dir "$workspace" "$PARSED_CWD" >/dev/null
+  fi
+  if [[ ${#PARSED_RO_MOUNTS[@]} -gt 0 ]]; then
+    local cname
+    cname="$(container_name "$workspace")"
+    if container_exists "$cname"; then
+      ensure_container_mode "$cname" "$PARSED_MODE"
+      ensure_requested_ro_mounts "$cname" "$workspace"
+    fi
   fi
   cmd_stop "$@"
   cmd_start "$@"
@@ -1330,12 +1388,12 @@ cmd_restart() {
 # -- dispatch -----------------------------------------------------------------
 
 usage() {
-  echo "Usage: $0 {build [--force]|start|stop|restart|rm|status|logs|version|help} [--copilot|--gemini|--opencode] [--cwd|-cwd <relative-subdir>] [workspace]"
+  echo "Usage: $0 {build [--force]|start|stop|restart|rm|status|logs|version|help} [--copilot|--gemini|--opencode] [--cwd|-cwd <relative-subdir>] [--ro-mount <path>]... [workspace]"
   echo
   echo "  build   [--force]                        Rebuild image if embedded content changed (--force always rebuilds)"
-  echo "  start   [--copilot|--gemini|--opencode] [--cwd|-cwd <relative-subdir>] [workspace] Attach to session or start a new one (default: \$PWD)"
+  echo "  start   [--copilot|--gemini|--opencode] [--cwd|-cwd <relative-subdir>] [--ro-mount <path>]... [workspace] Attach to session or start a new one (default: \$PWD)"
   echo "  stop    [--copilot|--gemini|--opencode] [workspace] Stop the container, preserving its state (default: \$PWD)"
-  echo "  restart [--copilot|--gemini|--opencode] [--cwd|-cwd <relative-subdir>] [workspace] Stop then start the container (default: \$PWD)"
+  echo "  restart [--copilot|--gemini|--opencode] [--cwd|-cwd <relative-subdir>] [--ro-mount <path>]... [workspace] Stop then start the container (default: \$PWD)"
   echo "  rm      [--copilot|--gemini|--opencode] [workspace] Remove the container (default: \$PWD)"
   echo "  status  [--copilot|--gemini|--opencode] [workspace] Show container status; no arg lists all (default: \$PWD)"
   echo "  logs    [--copilot|--gemini|--opencode] [workspace] Tail container logs (default: \$PWD)"
@@ -1347,6 +1405,8 @@ usage() {
   echo "  --opencode                      Use OpenCode instead of Claude."
   echo "  --cwd, -cwd <relative-subdir>    In --opencode mode, start OpenCode in an existing relative workspace subdirectory."
   echo "  --cwd=..., -cwd=...              Same as above; mount root and container name still use [workspace]."
+  echo "  --ro-mount <path>                Mount an existing host path read-only at the same resolved absolute path. Repeatable."
+  echo "  --ro-mount=<path>                Same as above. Existing containers must already have requested mounts."
 }
 
 if [[ "${AIND_SOURCE_ONLY:-}" == "1" ]]; then
