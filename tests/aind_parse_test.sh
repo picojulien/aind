@@ -87,6 +87,9 @@ expect_failure "-cwd separate dash argument fails" "requires a relative OpenCode
 expect_failure "--ro-mount without value fails" "--ro-mount requires a non-empty path" parse_args --ro-mount
 expect_failure "--ro-mount empty separate value fails" "--ro-mount requires a non-empty path" parse_args --ro-mount ""
 expect_failure "--ro-mount empty equals value fails" "--ro-mount requires a non-empty path" parse_args --ro-mount=
+expect_failure "--rw-mount without value fails" "--rw-mount requires a non-empty path" parse_args --rw-mount
+expect_failure "--rw-mount empty separate value fails" "--rw-mount requires a non-empty path" parse_args --rw-mount ""
+expect_failure "--rw-mount empty equals value fails" "--rw-mount requires a non-empty path" parse_args --rw-mount=
 
 mkdir -p "$TMP_DIR/empty-path"
 for help_arg in --help -h help; do
@@ -129,9 +132,38 @@ assert_eq "$TMP_DIR/real/a" "${PARSED_RO_MOUNTS[0]}" "deduplicated --ro-mount pa
 
 expect_failure "--ro-mount missing path fails" "Read-only mount path does not exist" parse_args --ro-mount "$TMP_DIR/missing-mount"
 
+parse_args --rw-mount "$TMP_DIR/real/a" workspace
+assert_eq "workspace" "$PARSED_WORKSPACE" "--rw-mount preserves workspace"
+assert_array_len 1 "${#PARSED_RW_MOUNTS[@]}" "--rw-mount parses separate value"
+assert_eq "$TMP_DIR/real/a" "${PARSED_RW_MOUNTS[0]}" "--rw-mount stores resolved separate value"
+
+parse_args --rw-mount="$TMP_DIR/real/a/b" workspace
+assert_eq "workspace" "$PARSED_WORKSPACE" "--rw-mount= preserves workspace"
+assert_array_len 1 "${#PARSED_RW_MOUNTS[@]}" "--rw-mount= parses value"
+assert_eq "$TMP_DIR/real/a/b" "${PARSED_RW_MOUNTS[0]}" "--rw-mount= stores resolved value"
+
+parse_args --opencode --rw-mount "$TMP_DIR/real/a" workspace --cwd b --rw-mount="$TMP_DIR/real/a/b"
+assert_eq "opencode" "$PARSED_MODE" "multiple --rw-mount keeps mode"
+assert_eq "workspace" "$PARSED_WORKSPACE" "multiple --rw-mount keeps workspace"
+assert_eq "b" "$PARSED_CWD" "multiple --rw-mount keeps cwd"
+assert_array_len 2 "${#PARSED_RW_MOUNTS[@]}" "multiple --rw-mount values parse"
+assert_eq "$TMP_DIR/real/a" "${PARSED_RW_MOUNTS[0]}" "multiple --rw-mount first value stored"
+assert_eq "$TMP_DIR/real/a/b" "${PARSED_RW_MOUNTS[1]}" "multiple --rw-mount second value stored"
+
+parse_args --rw-mount "$TMP_DIR/link/a" --rw-mount "$TMP_DIR/real/a" workspace
+assert_array_len 1 "${#PARSED_RW_MOUNTS[@]}" "equivalent --rw-mount paths deduplicate"
+assert_eq "$TMP_DIR/real/a" "${PARSED_RW_MOUNTS[0]}" "deduplicated --rw-mount path is resolved"
+
+printf 'not a directory\n' > "$TMP_DIR/not-a-dir"
+expect_failure "--rw-mount missing path fails" "Read-write mount path does not exist" parse_args --rw-mount "$TMP_DIR/missing-rw-mount"
+expect_failure "--rw-mount non-directory path fails" "Read-write mount path is not a directory" parse_args --rw-mount "$TMP_DIR/not-a-dir"
+expect_failure "same path cannot be read-only and read-write" "cannot be both --ro-mount and --rw-mount" parse_args --ro-mount "$TMP_DIR/real/a" --rw-mount "$TMP_DIR/link/a"
+expect_failure "same path cannot be read-write and read-only" "cannot be both --ro-mount and --rw-mount" parse_args --rw-mount "$TMP_DIR/link/a" --ro-mount "$TMP_DIR/real/a"
+
 (
   workspace="$TMP_DIR/docker-run-workspace"
   ro_mount="$TMP_DIR/real/a"
+  rw_mount="$TMP_DIR/real/a/b"
   mkdir -p "$workspace"
   TOKENS_DIR="$TMP_DIR/docker-run-tokens"
   cname="$(container_name "$workspace")"
@@ -151,8 +183,9 @@ expect_failure "--ro-mount missing path fails" "Read-only mount path does not ex
     esac
   }
 
-  cmd_start --ro-mount "$ro_mount" "$workspace"
+  cmd_start --ro-mount "$ro_mount" --rw-mount "$rw_mount" "$workspace"
   assert_file_has_line "$TMP_DIR/docker-run.args" "$ro_mount:$ro_mount:ro" "cmd_start docker run read-only mount includes :ro"
+  assert_file_has_line "$TMP_DIR/docker-run.args" "$rw_mount:$rw_mount:rw" "cmd_start docker run read-write mount includes :rw"
 )
 
 (
@@ -178,6 +211,28 @@ expect_failure "--ro-mount missing path fails" "Read-only mount path does not ex
 )
 
 (
+  workspace="$TMP_DIR/existing-rw-workspace"
+  rw_mount="$TMP_DIR/real/a"
+  mkdir -p "$workspace"
+
+  container_exists() { return 0; }
+  container_running() { fail "container_running should not be reached when requested read-write mount is absent"; }
+  docker() {
+    if [[ "$1" == "inspect" && "$2" == "--format" ]]; then
+      case "$3" in
+        *Config.Labels*) printf '<no value>\n' ;;
+        *Mounts*) printf 'bind\t%s\t%s\ttrue\n' "$workspace" "$workspace" ;;
+        *) fail "unexpected docker inspect format in missing rw mount test: $3" ;;
+      esac
+      return 0
+    fi
+    fail "unexpected docker command in missing rw mount test: $*"
+  }
+
+  expect_failure "existing container missing requested --rw-mount fails" "Remove and recreate it" cmd_start --rw-mount "$rw_mount" "$workspace"
+)
+
+(
   workspace="$TMP_DIR/restart-existing-workspace"
   ro_mount="$TMP_DIR/real/a"
   mkdir -p "$workspace"
@@ -198,6 +253,29 @@ expect_failure "--ro-mount missing path fails" "Read-only mount path does not ex
   }
 
   expect_failure "restart validates missing requested --ro-mount before stop" "Remove and recreate it" cmd_restart --ro-mount "$ro_mount" "$workspace"
+)
+
+(
+  workspace="$TMP_DIR/restart-existing-rw-workspace"
+  rw_mount="$TMP_DIR/real/a"
+  mkdir -p "$workspace"
+
+  container_exists() { return 0; }
+  cmd_stop() { fail "cmd_restart should validate requested read-write mounts before stop"; }
+  cmd_start() { fail "cmd_restart should validate requested read-write mounts before start"; }
+  docker() {
+    if [[ "$1" == "inspect" && "$2" == "--format" ]]; then
+      case "$3" in
+        *Config.Labels*) printf '<no value>\n' ;;
+        *Mounts*) printf 'bind\t%s\t%s\ttrue\n' "$workspace" "$workspace" ;;
+        *) fail "unexpected docker inspect format in restart missing rw mount test: $3" ;;
+      esac
+      return 0
+    fi
+    fail "unexpected docker command in restart missing rw mount test: $*"
+  }
+
+  expect_failure "restart validates missing requested --rw-mount before stop" "Remove and recreate it" cmd_restart --rw-mount "$rw_mount" "$workspace"
 )
 
 start_direct="$(validate_opencode_start_dir "$TMP_DIR/link/a/b" "")"
