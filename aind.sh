@@ -43,6 +43,20 @@
 #   gemini mode:
 #   ~/.gemini/      — Gemini CLI config and credentials.
 #
+#   opencode mode:
+#   ~/.config/opencode/      — OpenCode config and credentials.
+#   ~/.local/share/opencode/ — OpenCode local data, auth.json, sessions.
+#   ~/.cache/opencode/       — OpenCode cache, npm plugins, indexes.
+#   ~/.local/state/opencode/ — OpenCode UI state, model selection.
+#   ~/.aind/opencode.jsonc   — shared AIND OpenCode config, mounted read-only
+#                               as /etc/opencode/opencode.jsonc. Created when
+#                               missing; legacy AIND defaults are migrated, and
+#                               custom local edits persist.
+#
+#   ~/.aind/<cname>.claude_settings_local.json — per-container Claude settings
+#                     override, mounted as ~/.claude/settings.local.json inside
+#                     the container. Edit it to customize hooks (e.g. Notification)
+#                     without touching the host settings.
 #   ~/.aind/<cname>.github_token  — fine-grained GitHub PAT passed as GH_TOKEN.
 #   ~/.aind/<cname>.gitlab_token  — GitLab PAT passed as GITLAB_TOKEN.
 #                     Both tokens cover git transport (clone/push/pull via
@@ -52,6 +66,8 @@
 #                     this carefully — never use $HOME as the workspace or you
 #                     expose your entire home directory including SSH keys,
 #                     .env files, and other secrets.
+#                     In OpenCode mode, --cwd/-cwd starts OpenCode in an existing
+#                     subdirectory while keeping this mount as the workspace root.
 #
 # Network: the container has unrestricted outbound internet access, so any of
 # the data listed above can be exfiltrated by a malicious tool or dependency.
@@ -59,7 +75,7 @@
 
 set -euo pipefail
 
-VERSION=12
+VERSION=14
 
 IMAGE_NAME="aind"
 CONTAINER_PREFIX="aind-"
@@ -78,17 +94,57 @@ sha256_cmd() {
 
 # realpath is GNU coreutils; not available by default on macOS.
 # Fall back to readlink -f (also GNU, but present on more systems),
-# then to a pure-bash resolution that handles relative paths without
-# resolving symlinks.
+# then to a pure-bash resolution that canonicalizes the existing path or nearest
+# existing parent while preserving missing leaf creation.
 resolve_path() {
   if command -v realpath >/dev/null 2>&1; then
     realpath "$1"
   elif readlink -f "$1" >/dev/null 2>&1; then
     readlink -f "$1"
   else
-    local path="$1"
+    local path="$1" parent leaf resolved suffix=""
     [[ "$path" == /* ]] || path="$PWD/$path"
-    echo "$path"
+
+    if [[ -d "$path" ]]; then
+      (cd -- "$path" && pwd -P)
+      return 0
+    fi
+
+    if [[ -e "$path" ]]; then
+      parent="${path%/*}"
+      leaf="${path##*/}"
+      [[ "$parent" != "$path" && -n "$parent" ]] || parent="/"
+      resolved="$(cd -- "$parent" && pwd -P)"
+      if [[ "$resolved" == "/" ]]; then
+        printf '/%s\n' "$leaf"
+      else
+        printf '%s/%s\n' "$resolved" "$leaf"
+      fi
+      return 0
+    fi
+
+    parent="$path"
+    while [[ "$parent" != "/" && ! -d "$parent" ]]; do
+      leaf="${parent##*/}"
+      suffix="${leaf}${suffix:+/$suffix}"
+      parent="${parent%/*}"
+      [[ -n "$parent" ]] || parent="/"
+    done
+
+    if [[ -d "$parent" ]]; then
+      resolved="$(cd -- "$parent" && pwd -P)"
+      if [[ -n "$suffix" ]]; then
+        if [[ "$resolved" == "/" ]]; then
+          printf '/%s\n' "$suffix"
+        else
+          printf '%s/%s\n' "$resolved" "$suffix"
+        fi
+      else
+        printf '%s\n' "$resolved"
+      fi
+    else
+      printf '%s\n' "$path"
+    fi
   fi
 }
 
@@ -117,19 +173,87 @@ container_name() {
   echo "${CONTAINER_PREFIX}${workspace}" | tr '/' '-'
 }
 
-# Parse mode flag and optional workspace path from arguments.
-# Outputs two space-separated fields: <claude|copilot|gemini> <workspace_or_empty>
-# Usage: read -r mode workspace_arg <<< "$(parse_args "$@")"
+# Parse mode flag, optional --cwd/-cwd, and optional workspace path from arguments.
+# Sets PARSED_MODE, PARSED_CWD, and PARSED_WORKSPACE.
 parse_args() {
-  local mode="claude" workspace=""
-  for arg in "$@"; do
-    case "$arg" in
-      --copilot) mode="copilot" ;;
-      --gemini)  mode="gemini" ;;
-      *)         workspace="$arg" ;;
+  PARSED_MODE="claude"
+  PARSED_CWD=""
+  PARSED_WORKSPACE=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --copilot) PARSED_MODE="copilot"; shift ;;
+      --gemini)  PARSED_MODE="gemini"; shift ;;
+      --opencode) PARSED_MODE="opencode"; shift ;;
+      --cwd|-cwd)
+        [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != -* ]] \
+          || err "--cwd/-cwd requires a relative OpenCode start subdirectory."
+        PARSED_CWD="$2"
+        shift 2
+        ;;
+      --cwd=*|-cwd=*)
+        PARSED_CWD="${1#*=}"
+        [[ -n "$PARSED_CWD" ]] \
+          || err "--cwd/-cwd requires a relative OpenCode start subdirectory."
+        shift
+        ;;
+      --*)
+        err "Unknown option: $1"
+        ;;
+      -*)
+        err "Unknown option: $1"
+        ;;
+      *)
+        PARSED_WORKSPACE="$1"
+        shift
+        ;;
     esac
   done
-  echo "$mode" "$workspace"
+
+  if [[ -n "$PARSED_CWD" && "$PARSED_MODE" != "opencode" ]]; then
+    err "--cwd/-cwd can only be used with --opencode."
+  fi
+}
+
+# Resolve an existing directory physically, following symlinks.
+resolve_existing_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 1
+  (cd -- "$dir" && pwd -P)
+}
+
+# Validate that OpenCode starts in an existing relative subdirectory inside the
+# mounted workspace. Prints the resolved start directory.
+validate_opencode_start_dir() {
+  local workspace="$1" cwd="${2:-}" workspace_resolved start_dir
+  if [[ -z "$cwd" ]]; then
+    if start_dir="$(resolve_existing_dir "$workspace")"; then
+      printf '%s\n' "$start_dir"
+    else
+      printf '%s\n' "$workspace"
+    fi
+    return 0
+  fi
+
+  [[ "$cwd" != /* ]] \
+    || err "--cwd/-cwd must be relative, not absolute: $cwd"
+
+  if ! workspace_resolved="$(resolve_existing_dir "$workspace")"; then
+    err "OpenCode workspace must exist and be a directory when --cwd/-cwd is used: $workspace"
+  fi
+  if ! start_dir="$(resolve_existing_dir "$workspace_resolved/$cwd")"; then
+    err "--cwd/-cwd must be an existing directory under the workspace: $cwd"
+  fi
+
+  if [[ "$workspace_resolved" == "/" ]]; then
+    printf '%s\n' "$start_dir"
+    return 0
+  fi
+
+  case "$start_dir" in
+    "$workspace_resolved"|"$workspace_resolved"/*) printf '%s\n' "$start_dir" ;;
+    *) err "--cwd/-cwd resolves outside the workspace: $cwd" ;;
+  esac
 }
 
 # Check whether the container with the given name is currently running.
@@ -140,6 +264,206 @@ container_running() {
 # Check whether the container exists in any state (running, stopped, etc.).
 container_exists() {
   [[ -n $(docker ps -aq --filter "name=^${1}$") ]]
+}
+
+# Read the aind mode label from an existing container. Older containers do not
+# have this label; return empty so they remain compatible.
+container_mode_label() {
+  local mode
+  mode="$(docker inspect --format '{{ index .Config.Labels "aind.mode" }}' "$1" 2>/dev/null || true)"
+  [[ "$mode" == "<no value>" ]] && mode=""
+  echo "$mode"
+}
+
+# Prevent accidentally reusing a labeled container with a different tool mode.
+ensure_container_mode() {
+  local cname="$1" requested_mode="$2" existing_mode
+  existing_mode="$(container_mode_label "$cname")"
+  if [[ -n "$existing_mode" && "$existing_mode" != "$requested_mode" ]]; then
+    err "Container '$cname' was created for '$existing_mode' mode, but '$requested_mode' was requested. Use the original mode or remove the container first."
+  fi
+}
+
+# Check whether an existing container has a bind mount at the given destination.
+container_has_bind_mount() {
+  local cname="$1" destination="$2" mounts
+  mounts="$(docker inspect --format '{{ range .Mounts }}{{ .Type }} {{ .Destination }}{{ "\n" }}{{ end }}' "$cname" 2>/dev/null || true)"
+  [[ $'\n'"$mounts"$'\n' == *$'\n'"bind $destination"$'\n'* ]]
+}
+
+# Check whether an existing container has a read-only bind mount from the
+# expected host source at the given destination.
+container_has_readonly_bind_mount_from() {
+  local cname="$1" destination="$2" expected_source="$3"
+  local expected_source_resolved mounts type source mount_destination rw
+  expected_source_resolved="$(resolve_path "$expected_source")"
+  mounts="$(docker inspect --format '{{ range .Mounts }}{{ .Type }}{{ "\t" }}{{ .Source }}{{ "\t" }}{{ .Destination }}{{ "\t" }}{{ .RW }}{{ "\n" }}{{ end }}' "$cname" 2>/dev/null || true)"
+
+  while IFS=$'\t' read -r type source mount_destination rw; do
+    if [[ "$type" == "bind" && "$mount_destination" == "$destination" && "$rw" == "false" &&
+          ( "$source" == "$expected_source" || "$source" == "$expected_source_resolved" ) ]]; then
+      return 0
+    fi
+  done <<< "$mounts"
+  return 1
+}
+
+# OpenCode credentials and AIND config live in mode-specific bind mounts.
+# Existing containers created before OpenCode support may not have them, so fail
+# before attaching.
+ensure_opencode_mounts() {
+  local cname="$1" workspace="$2" missing=()
+  container_has_bind_mount "$cname" "/home/node/.config/opencode" \
+    || missing+=("/home/node/.config/opencode")
+  container_has_bind_mount "$cname" "/home/node/.local/share/opencode" \
+    || missing+=("/home/node/.local/share/opencode")
+  container_has_bind_mount "$cname" "/home/node/.cache/opencode" \
+    || missing+=("/home/node/.cache/opencode")
+  container_has_bind_mount "$cname" "/home/node/.local/state/opencode" \
+    || missing+=("/home/node/.local/state/opencode")
+  container_has_readonly_bind_mount_from "$cname" "/etc/opencode/opencode.jsonc" "$TOKENS_DIR/opencode.jsonc" \
+    || missing+=("/etc/opencode/opencode.jsonc (read-only from $TOKENS_DIR/opencode.jsonc)")
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Container '$cname' is missing or has invalid OpenCode bind mount(s): ${missing[*]}. Remove and recreate it with: aind rm --opencode '$workspace' && aind start --opencode '$workspace'"
+  fi
+}
+
+# Create the shared AIND-managed OpenCode config when absent, or migrate known
+# AIND-generated defaults. Custom edits are not overwritten.
+# Agent permissions are explicit because OpenCode merges global and agent
+# permissions, and agent rules take precedence over the global yolo setting.
+opencode_builtin_agent_names() {
+  printf '%s\n' build plan general explore title summary compaction
+}
+
+opencode_discovered_agent_names() {
+  local workspace dir path name
+  local dirs=(
+    "$HOME/.config/opencode/agents"
+    "$HOME/.config/opencode/agent"
+  )
+  for workspace in "$@"; do
+    [[ -n "$workspace" ]] || continue
+    dirs+=(
+      "$workspace/.opencode/agents"
+      "$workspace/.opencode/agent"
+    )
+  done
+
+  for dir in "${dirs[@]}"; do
+    [[ -d "$dir" ]] || continue
+    for path in "$dir"/*.md; do
+      [[ -f "$path" ]] || continue
+      name="${path##*/}"
+      name="${name%.md}"
+      [[ -n "$name" && "$name" != *$'\n'* ]] || continue
+      printf '%s\n' "$name"
+    done
+  done
+}
+
+opencode_agent_names() {
+  { opencode_builtin_agent_names; opencode_discovered_agent_names "$@"; } | LC_ALL=C sort -u
+}
+
+opencode_json_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\t'/\\t}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\n'/\\n}"
+  printf '"%s"' "$value"
+}
+
+opencode_workspace_id_for_start_dir() {
+  local start_dir="$1"
+  printf 'ws-%s\n' "$(printf '%s\n' "$start_dir" | sha256_cmd | cut -c1-32)"
+}
+
+opencode_default_config_template() {
+  local agent first=true
+  cat <<'EOF'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "*": "allow"
+  },
+  "default_agent": "build",
+  "agent": {
+EOF
+  while IFS= read -r agent; do
+    if $first; then
+      first=false
+    else
+      printf ',\n'
+    fi
+    printf '    '
+    opencode_json_string "$agent"
+    printf ': {\n      "permission": {\n        "*": "allow"\n      }\n    }'
+  done < <(opencode_agent_names "$@")
+  cat <<'EOF'
+
+  }
+}
+EOF
+}
+
+opencode_config_is_legacy() {
+  local config="$1" current legacy
+  IFS= read -r -d '' current < "$config" || true
+  IFS= read -r -d '' legacy <<'EOF' || true
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": "allow"
+}
+EOF
+
+  [[ "$current" == "$legacy" ]]
+}
+
+opencode_config_is_bad_permission_template() {
+  local config="$1" current bad_template
+  IFS= read -r -d '' current < "$config" || true
+  IFS= read -r -d '' bad_template <<'EOF' || true
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": "allow",
+  "default_agent": "build",
+  "agent": {
+    "build": {
+      "permission": "allow"
+    },
+    "plan": {
+      "permission": "allow"
+    },
+    "general": {
+      "permission": "allow"
+    },
+    "explore": {
+      "permission": "allow"
+    }
+  }
+}
+EOF
+
+  [[ "$current" == "$bad_template" ]]
+}
+
+ensure_opencode_config() {
+  local config="$TOKENS_DIR/opencode.jsonc"
+  [[ -e "$config" && ! -f "$config" ]] \
+    && err "OpenCode config path exists but is not a file: $config"
+  if [[ ! -f "$config" ]]; then
+    opencode_default_config_template "$@" > "$config"
+    chmod 600 "$config"
+  elif opencode_config_is_legacy "$config" || opencode_config_is_bad_permission_template "$config"; then
+    opencode_default_config_template "$@" > "$config"
+    chmod 600 "$config"
+  else
+    log "OpenCode config exists at $config; custom edits preserved. For yolo mode, use permission: {\"*\":\"allow\"} and agent entries with permission: {\"*\":\"allow\"}."
+  fi
 }
 
 # -- build context ------------------------------------------------------------
@@ -309,9 +633,14 @@ RUN curl -fsSL https://gh.io/copilot-install | bash
 # Install Gemini CLI.
 RUN npm install -g @google/gemini-cli
 
+# Install OpenCode CLI via the native installer.
+RUN curl -fsSL https://opencode.ai/install | bash
+ENV PATH="/home/node/.opencode/bin:$PATH"
+
 USER root
 # fd-find installs as fdfind on Debian; symlink to the conventional name.
 RUN ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+RUN mkdir -p /etc/opencode
 RUN echo "node ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/node && chmod 440 /etc/sudoers.d/node
 # Add node to the docker group so it can reach the DinD daemon socket without sudo.
 RUN usermod -aG docker node
@@ -449,15 +778,32 @@ read_gitlab_token() {
 #   - To pick up a new image build, remove the container first:
 #       docker rm <container-name>
 cmd_start() {
-  read -r mode workspace_arg <<< "$(parse_args "$@")"
+  parse_args "$@"
+  local mode="$PARSED_MODE" cwd="$PARSED_CWD" workspace_arg="$PARSED_WORKSPACE"
   local workspace
   workspace="$(resolve_path "${workspace_arg:-$PWD}")"
+  local start_dir="$workspace"
   local cname
   cname="$(container_name "$workspace")"
 
+  if [[ "$mode" == "opencode" ]]; then
+    start_dir="$(validate_opencode_start_dir "$workspace" "$cwd")"
+    mkdir -p "$TOKENS_DIR"
+    ensure_opencode_config "$workspace" "$start_dir"
+  fi
+
+  local exists=false
+  if container_exists "$cname"; then
+    ensure_container_mode "$cname" "$mode"
+    if [[ "$mode" == "opencode" ]]; then
+      ensure_opencode_mounts "$cname" "$workspace"
+    fi
+    exists=true
+  fi
+
   if container_running "$cname"; then
     : # already running, fall through to attach
-  elif container_exists "$cname"; then
+  elif $exists; then
     log "Restarting stopped container '$cname'..."
     docker start "$cname"
   else
@@ -469,6 +815,8 @@ cmd_start() {
     #   claude:  ~/.claude (config/history) and ~/.claude.json
     #   copilot: ~/.copilot
     #   gemini:  ~/.gemini
+    #   opencode: ~/.config/opencode, ~/.local/share/opencode, and
+    #     AIND's shared OpenCode config mounted read-only under /etc/opencode.
     local config_mounts=()
     case "$mode" in
       copilot)
@@ -480,20 +828,38 @@ cmd_start() {
         config_mounts=(
           -v "$HOME/.gemini:/home/node/.gemini"
         ) ;;
+      opencode)
+        mkdir -p "$HOME/.config/opencode" "$HOME/.local/share/opencode" \
+                 "$HOME/.cache/opencode" "$HOME/.local/state/opencode"
+        chmod 700 "$HOME/.config/opencode" "$HOME/.local/share/opencode" \
+                  "$HOME/.cache/opencode" "$HOME/.local/state/opencode"
+        local opencode_config="$TOKENS_DIR/opencode.jsonc"
+        config_mounts=(
+          -v "$HOME/.config/opencode:/home/node/.config/opencode"
+          -v "$HOME/.local/share/opencode:/home/node/.local/share/opencode"
+          -v "$HOME/.cache/opencode:/home/node/.cache/opencode"
+          -v "$HOME/.local/state/opencode:/home/node/.local/state/opencode"
+          -v "$opencode_config:/etc/opencode/opencode.jsonc:ro"
+        ) ;;
       *)
+        local settings_local="$TOKENS_DIR/${cname}.claude_settings_local.json"
+        [[ -f "$settings_local" ]] || echo '{}' > "$settings_local"
         config_mounts=(
           -v "$HOME/.claude:/home/node/.claude"
           -v "$HOME/.claude.json:/home/node/.claude.json"
+          -v "$settings_local:/home/node/.claude/settings.local.json"
         ) ;;
     esac
 
     log "Starting container '$cname' (workspace: $workspace)..."
     # USER_UID/USER_GID: passed to the entrypoint so it can remap the node user.
-    # WORKSPACE: made available inside the container so tmux can cd into it.
+    # WORKSPACE: mounted workspace root, available inside the container.
     # GIT_*: set the git identity for all commits made by the AI tool.
     # GH_TOKEN/GITLAB_TOKEN: injected at exec time (not run time) so a
     #   stop/start cycle picks up updated token files without needing docker rm.
     # workspace mount: uses the exact host path so paths match on both sides.
+    # aind.mode label: detects accidental reuse of a workspace container with
+    #   a different AI tool mode on future runs.
     # sleep infinity: keeps the container alive with no resource cost; all work
     #   happens inside a tmux session started via docker exec.
     # --runtime=sysbox-runc: uses the sysbox container runtime instead of the
@@ -512,14 +878,15 @@ cmd_start() {
 
     docker run -d \
       ${runtime_flag:+"$runtime_flag"} \
+      --label "aind.mode=$mode" \
       --name "$cname" \
       -e USER_UID="$(id -u)" \
       -e USER_GID="$(id -g)" \
       -e WORKSPACE="$workspace" \
-      -e GIT_AUTHOR_NAME="$(case "$mode" in copilot) echo 'GitHub Copilot';; gemini) echo 'Gemini CLI';; *) echo 'Claude Code';; esac)" \
-      -e GIT_AUTHOR_EMAIL="$(case "$mode" in copilot) echo 'noreply@github.com';; gemini) echo 'noreply@google.com';; *) echo 'noreply@anthropic.com';; esac)" \
-      -e GIT_COMMITTER_NAME="$(case "$mode" in copilot) echo 'GitHub Copilot';; gemini) echo 'Gemini CLI';; *) echo 'Claude Code';; esac)" \
-      -e GIT_COMMITTER_EMAIL="$(case "$mode" in copilot) echo 'noreply@github.com';; gemini) echo 'noreply@google.com';; *) echo 'noreply@anthropic.com';; esac)" \
+      -e GIT_AUTHOR_NAME="$(case "$mode" in copilot) echo 'GitHub Copilot';; gemini) echo 'Gemini CLI';; opencode) echo 'OpenCode';; *) echo 'Claude Code';; esac)" \
+      -e GIT_AUTHOR_EMAIL="$(case "$mode" in copilot) echo 'noreply@github.com';; gemini) echo 'noreply@google.com';; opencode) echo 'noreply@opencode.ai';; *) echo 'noreply@anthropic.com';; esac)" \
+      -e GIT_COMMITTER_NAME="$(case "$mode" in copilot) echo 'GitHub Copilot';; gemini) echo 'Gemini CLI';; opencode) echo 'OpenCode';; *) echo 'Claude Code';; esac)" \
+      -e GIT_COMMITTER_EMAIL="$(case "$mode" in copilot) echo 'noreply@github.com';; gemini) echo 'noreply@google.com';; opencode) echo 'noreply@opencode.ai';; *) echo 'noreply@anthropic.com';; esac)" \
       "${config_mounts[@]}" \
       -v "$workspace:$workspace" \
       --workdir "$workspace" \
@@ -554,6 +921,7 @@ cmd_start() {
   case "$mode" in
     copilot) mode_icon="🤖" ;;
     gemini)  mode_icon="✨" ;;
+    opencode) mode_icon="🔓" ;;
     *)       mode_icon="🧠" ;;
   esac
   printf '\033]0;%s\007' "${mode_icon} $(basename "$workspace") - ${workspace}"
@@ -570,27 +938,77 @@ cmd_start() {
   #            --dangerously-skip-permissions is safe here: the container's isolated filesystem
   #            is the security boundary.
   #   copilot: registers git credential helpers, then runs copilot --allow-all.
-  #   gemini:  registers git credential helpers, then runs gemini.
+  #   gemini:  registers git credential helpers, then runs gemini --yolo.
+  #   opencode: registers git credential helpers, then runs the OpenCode TUI.
+  #             Permission bypass for the TUI is configured via /etc/opencode/opencode.jsonc;
+  #             --dangerously-skip-permissions is only valid for `opencode run`.
   local tmux_cmd
   case "$mode" in
     copilot) tmux_cmd="gh auth setup-git 2>/dev/null; glab auth setup-git 2>/dev/null; copilot --allow-all; exec zsh" ;;
     gemini)  tmux_cmd="gh auth setup-git 2>/dev/null; glab auth setup-git 2>/dev/null; gemini --yolo; exec zsh" ;;
+    opencode) tmux_cmd="gh auth setup-git 2>/dev/null; glab auth setup-git 2>/dev/null; opencode; exec zsh" ;;
     *)       tmux_cmd="gh auth setup-git 2>/dev/null; glab auth setup-git 2>/dev/null; claude --dangerously-skip-permissions; exec zsh" ;;
   esac
 
+  local exec_env=(
+    -e TERM="${TERM:-xterm-256color}"
+    -e LANG="${LANG:-C.UTF-8}"
+    -e LC_ALL="${LC_ALL:-C.UTF-8}"
+    -e HOME=/home/node
+    -e WORKSPACE="$workspace"
+    -e AIND_START_DIR="$start_dir"
+    -e GH_TOKEN="$gh_token"
+    -e GITLAB_TOKEN="$gitlab_token"
+  )
+  if [[ "$mode" == "opencode" ]]; then
+    # OpenCode scopes sessions by a random workspace_id generated at server start.
+    # We pin it to a deterministic hash of the OpenCode start directory so the
+    # same directory always gets the same workspace_id — both inside and outside
+    # the container.
+    # To see the same sessions on the host, export the value printed below.
+    local opencode_workspace_id
+    opencode_workspace_id="$(opencode_workspace_id_for_start_dir "$start_dir")"
+    log "OpenCode start directory: $start_dir"
+    log "OpenCode workspace ID for start directory: $opencode_workspace_id"
+    log "  → to share sessions with the host, run on the host:"
+    log "      export OPENCODE_WORKSPACE_ID=$opencode_workspace_id"
+
+    # OpenCode config does not currently expose LSP tool activation.
+    exec_env+=(
+      -e XDG_CONFIG_HOME=/home/node/.config
+      -e XDG_DATA_HOME=/home/node/.local/share
+      -e XDG_CACHE_HOME=/home/node/.cache
+      -e XDG_STATE_HOME=/home/node/.local/state
+      -e OPENCODE_EXPERIMENTAL_LSP_TOOL=true
+      -e OPENCODE_WORKSPACE_ID="$opencode_workspace_id"
+    )
+  fi
+
   # Forward terminal settings so the UI renders correctly inside the container.
   # Double-quoting the bash -c string lets the host shell expand $tmux_cmd now,
-  # while \$WORKSPACE is deferred to the container's bash via the escaped $.
+  # while \$AIND_START_DIR is deferred to the container's bash via the escaped $.
   docker exec -it --user node \
-    -e TERM="${TERM:-xterm-256color}" \
-    -e LANG="${LANG:-C.UTF-8}" \
-    -e LC_ALL="${LC_ALL:-C.UTF-8}" \
-    -e GH_TOKEN="$gh_token" \
-    -e GITLAB_TOKEN="$gitlab_token" \
+    "${exec_env[@]}" \
     "$cname" bash -c "
+    : \"\${AIND_START_DIR:=\$WORKSPACE}\"
     if ! tmux has-session -t main 2>/dev/null; then
-      tmux new-session -s main -c \"\$WORKSPACE\" \"${tmux_cmd}\"
+      tmux_env=( -e \"WORKSPACE=\$WORKSPACE\" -e \"AIND_START_DIR=\$AIND_START_DIR\" )
+      if [[ -n \"\${OPENCODE_WORKSPACE_ID:-}\" ]]; then
+        # Pass OpenCode env through tmux so new sessions receive it even if a
+        # tmux server already exists with older environment state.
+        tmux_env+=( -e \"HOME=\$HOME\" )
+        tmux_env+=( -e \"XDG_CONFIG_HOME=\$XDG_CONFIG_HOME\" )
+        tmux_env+=( -e \"XDG_DATA_HOME=\$XDG_DATA_HOME\" )
+        tmux_env+=( -e \"XDG_CACHE_HOME=\$XDG_CACHE_HOME\" )
+        tmux_env+=( -e \"XDG_STATE_HOME=\$XDG_STATE_HOME\" )
+        tmux_env+=( -e \"OPENCODE_EXPERIMENTAL_LSP_TOOL=\$OPENCODE_EXPERIMENTAL_LSP_TOOL\" )
+        tmux_env+=( -e \"OPENCODE_WORKSPACE_ID=\$OPENCODE_WORKSPACE_ID\" )
+      fi
+      tmux new-session -s main -c \"\$AIND_START_DIR\" \"\${tmux_env[@]}\" \"${tmux_cmd}\"
     else
+      if [[ -n \"\${OPENCODE_WORKSPACE_ID:-}\" ]]; then
+        printf '[aind] OpenCode tmux session already exists; exit or kill it, then re-run aind, to pick up start directory, workspace ID, or config changes.\\n' >&2
+      fi
       tmux attach -t main
     fi
   "
@@ -600,7 +1018,8 @@ cmd_start() {
 # writable layer (installed packages, etc.) survives and is reused on the next
 # start. To fully remove the container use the rm command.
 cmd_stop() {
-  read -r _mode workspace_arg <<< "$(parse_args "$@")"
+  parse_args "$@"
+  local workspace_arg="$PARSED_WORKSPACE"
   local workspace cname
   workspace="$(resolve_path "${workspace_arg:-$PWD}")"
   cname="$(container_name "$workspace")"
@@ -616,7 +1035,8 @@ cmd_stop() {
 # because the entire writable layer (including any dockerd state) is discarded
 # anyway.
 cmd_rm() {
-  read -r _mode workspace_arg <<< "$(parse_args "$@")"
+  parse_args "$@"
+  local workspace_arg="$PARSED_WORKSPACE"
   local workspace cname
   workspace="$(resolve_path "${workspace_arg:-$PWD}")"
   cname="$(container_name "$workspace")"
@@ -630,7 +1050,8 @@ cmd_version() {
 }
 
 cmd_status() {
-  read -r _mode workspace_arg <<< "$(parse_args "$@")"
+  parse_args "$@"
+  local workspace_arg="$PARSED_WORKSPACE"
   if [[ -z "$workspace_arg" ]]; then
     docker ps -a --filter "name=^${CONTAINER_PREFIX}"
   else
@@ -641,7 +1062,8 @@ cmd_status() {
 }
 
 cmd_logs() {
-  read -r _mode workspace_arg <<< "$(parse_args "$@")"
+  parse_args "$@"
+  local workspace_arg="$PARSED_WORKSPACE"
   local workspace cname
   workspace="$(resolve_path "${workspace_arg:-$PWD}")"
   cname="$(container_name "$workspace")"
@@ -649,6 +1071,12 @@ cmd_logs() {
 }
 
 cmd_restart() {
+  parse_args "$@"
+  if [[ "$PARSED_MODE" == "opencode" ]]; then
+    local workspace
+    workspace="$(resolve_path "${PARSED_WORKSPACE:-$PWD}")"
+    validate_opencode_start_dir "$workspace" "$PARSED_CWD" >/dev/null
+  fi
   cmd_stop "$@"
   cmd_start "$@"
 }
@@ -656,20 +1084,35 @@ cmd_restart() {
 # -- dispatch -----------------------------------------------------------------
 
 usage() {
-  echo "Usage: $0 {build [--force]|start|stop|restart|rm|status|logs|version} [--copilot|--gemini] [workspace]"
+  echo "Usage: $0 {build [--force]|start|stop|restart|rm|status|logs|version|help} [--copilot|--gemini|--opencode] [--cwd|-cwd <relative-subdir>] [workspace]"
   echo
   echo "  build   [--force]                        Rebuild image if embedded content changed (--force always rebuilds)"
-  echo "  start   [--copilot|--gemini] [workspace] Attach to session or start a new one (default: \$PWD)"
-  echo "  stop    [--copilot|--gemini] [workspace] Stop the container, preserving its state (default: \$PWD)"
-  echo "  restart [--copilot|--gemini] [workspace] Stop then start the container (default: \$PWD)"
-  echo "  rm      [--copilot|--gemini] [workspace] Remove the container (default: \$PWD)"
-  echo "  status  [--copilot|--gemini] [workspace] Show container status; no arg lists all (default: \$PWD)"
-  echo "  logs    [--copilot|--gemini] [workspace] Tail container logs (default: \$PWD)"
+  echo "  start   [--copilot|--gemini|--opencode] [--cwd|-cwd <relative-subdir>] [workspace] Attach to session or start a new one (default: \$PWD)"
+  echo "  stop    [--copilot|--gemini|--opencode] [workspace] Stop the container, preserving its state (default: \$PWD)"
+  echo "  restart [--copilot|--gemini|--opencode] [--cwd|-cwd <relative-subdir>] [workspace] Stop then start the container (default: \$PWD)"
+  echo "  rm      [--copilot|--gemini|--opencode] [workspace] Remove the container (default: \$PWD)"
+  echo "  status  [--copilot|--gemini|--opencode] [workspace] Show container status; no arg lists all (default: \$PWD)"
+  echo "  logs    [--copilot|--gemini|--opencode] [workspace] Tail container logs (default: \$PWD)"
   echo "  version                                  Print the script version"
+  echo "  help                                     Print this help message"
   echo
-  echo "  --copilot  Use GitHub Copilot instead of Claude."
-  echo "  --gemini   Use Gemini CLI instead of Claude."
+  echo "  --copilot                       Use GitHub Copilot instead of Claude."
+  echo "  --gemini                        Use Gemini CLI instead of Claude."
+  echo "  --opencode                      Use OpenCode instead of Claude."
+  echo "  --cwd, -cwd <relative-subdir>    In --opencode mode, start OpenCode in an existing relative workspace subdirectory."
+  echo "  --cwd=..., -cwd=...              Same as above; mount root and container name still use [workspace]."
 }
+
+if [[ "${AIND_SOURCE_ONLY:-}" == "1" ]]; then
+  if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+  fi
+  exit 0
+fi
+
+case "${1:-}" in
+  --help|-h|help) usage; exit 0 ;;
+esac
 
 check_deps
 
