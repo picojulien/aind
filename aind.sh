@@ -68,6 +68,8 @@
 #                     .env files, and other secrets.
 #                     In OpenCode mode, --cwd/-cwd starts OpenCode in an existing
 #                     subdirectory while keeping this mount as the workspace root.
+#                     Linked git worktrees may also mount their external .git
+#                     metadata read-write so Git/OpenCode can identify the repo.
 #
 # Network: the container has unrestricted outbound internet access, so any of
 # the data listed above can be exfiltrated by a malicious tool or dependency.
@@ -256,6 +258,220 @@ validate_opencode_start_dir() {
   esac
 }
 
+path_is_at_or_under() {
+  local path="$1" root="$2"
+  [[ -n "$path" && -n "$root" ]] || return 1
+  if [[ "$root" == "/" ]]; then
+    [[ "$path" == /* ]]
+  else
+    [[ "$path" == "$root" || "$path" == "$root"/* ]]
+  fi
+}
+
+trim_git_metadata_path() {
+  local value="$1"
+  value="${value%$'\r'}"
+  while [[ "$value" == [[:space:]]* ]]; do
+    value="${value#?}"
+  done
+  while [[ "$value" == *[[:space:]] ]]; do
+    value="${value%?}"
+  done
+  printf '%s\n' "$value"
+}
+
+resolve_git_metadata_path() {
+  local base_dir="$1" path="$2"
+  if [[ "$path" == /* ]]; then
+    resolve_path "$path"
+  else
+    resolve_path "$base_dir/$path"
+  fi
+}
+
+read_gitdir_from_git_file() {
+  local git_file="$1" line gitdir
+  [[ -f "$git_file" ]] || return 1
+  IFS= read -r line < "$git_file" || return 1
+  case "$line" in
+    gitdir:*) gitdir="${line#gitdir:}" ;;
+    *) return 1 ;;
+  esac
+  gitdir="$(trim_git_metadata_path "$gitdir")"
+  [[ -n "$gitdir" ]] || return 1
+  printf '%s\n' "$gitdir"
+}
+
+read_common_git_dir() {
+  local gitdir="$1" line commondir resolved
+  [[ -f "$gitdir/commondir" ]] || return 1
+  IFS= read -r line < "$gitdir/commondir" || return 1
+  commondir="$(trim_git_metadata_path "$line")"
+  [[ -n "$commondir" ]] || return 1
+  resolved="$(resolve_git_metadata_path "$gitdir" "$commondir" 2>/dev/null)" || return 1
+  printf '%s\n' "$resolved"
+}
+
+read_gitdir_backlink() {
+  local gitdir="$1" line backlink resolved
+  [[ -f "$gitdir/gitdir" ]] || return 1
+  IFS= read -r line < "$gitdir/gitdir" || return 1
+  backlink="$(trim_git_metadata_path "$line")"
+  [[ -n "$backlink" ]] || return 1
+  resolved="$(resolve_git_metadata_path "$gitdir" "$backlink" 2>/dev/null)" || return 1
+  printf '%s\n' "$resolved"
+}
+
+read_core_worktree_from_git_config() {
+  local config="$1" line section="" key value
+  [[ -f "$config" ]] || return 1
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(trim_git_metadata_path "$line")"
+    [[ -n "$line" && "$line" != \#* && "$line" != \;* ]] || continue
+
+    if [[ "$line" == \[*\] ]]; then
+      section="${line#\[}"
+      section="${section%\]}"
+      section="${section%%[[:space:]]*}"
+      continue
+    fi
+
+    [[ "$section" == "core" && "$line" == *=* ]] || continue
+    key="$(trim_git_metadata_path "${line%%=*}")"
+    [[ "$key" == "worktree" ]] || continue
+    value="$(trim_git_metadata_path "${line#*=}")"
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+      value="${value#\"}"
+      value="${value%\"}"
+    fi
+    [[ -n "$value" ]] || return 1
+    printf '%s\n' "$value"
+    return 0
+  done < "$config"
+
+  return 1
+}
+
+path_has_git_metadata_component() {
+  case "$1" in
+    *.git|*.git/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+gitdir_has_standard_marker() {
+  local gitdir="$1"
+  [[ -f "$gitdir/HEAD" || -f "$gitdir/commondir" ]]
+}
+
+commondir_has_standard_marker() {
+  local commondir="$1"
+  [[ -f "$commondir/config" || -d "$commondir/objects" || -f "$commondir/HEAD" ]]
+}
+
+valid_gitdir_metadata_dir() {
+  local gitdir="$1"
+  [[ -d "$gitdir" ]] || return 1
+  gitdir_has_standard_marker "$gitdir" || return 1
+  path_has_git_metadata_component "$gitdir" && return 0
+
+  [[ -f "$gitdir/HEAD" && ( -f "$gitdir/commondir" || -f "$gitdir/config" || -d "$gitdir/objects" ) ]]
+}
+
+valid_common_git_metadata_dir() {
+  local commondir="$1"
+  [[ -d "$commondir" ]] || return 1
+  commondir_has_standard_marker "$commondir" || return 1
+  path_has_git_metadata_component "$commondir" && return 0
+
+  [[ ( -f "$commondir/config" && -f "$commondir/HEAD" ) ||
+     ( -d "$commondir/objects" && ( -f "$commondir/config" || -f "$commondir/HEAD" ) ) ]]
+}
+
+gitdir_backlink_matches_start_git_file() {
+  local gitdir="$1" start_git_file="$2" backlink start_git_file_resolved
+  backlink="$(read_gitdir_backlink "$gitdir")" || return 1
+  start_git_file_resolved="$(resolve_path "$start_git_file")"
+  [[ "$backlink" == "$start_git_file_resolved" ]]
+}
+
+gitdir_core_worktree_matches_start_dir() {
+  local gitdir="$1" start_dir="$2" worktree worktree_resolved start_dir_resolved
+  worktree="$(read_core_worktree_from_git_config "$gitdir/config")" || return 1
+  worktree_resolved="$(resolve_git_metadata_path "$gitdir" "$worktree" 2>/dev/null)" || return 1
+  start_dir_resolved="$(resolve_path "$start_dir")"
+  [[ "$worktree_resolved" == "$start_dir_resolved" ]]
+}
+
+opencode_append_extra_mount_path() {
+  local workspace="$1" path="$2" covered=false existing
+  shift 2
+
+  path_is_at_or_under "$path" "$workspace" && return 0
+  for existing in "$@"; do
+    if path_is_at_or_under "$path" "$existing"; then
+      covered=true
+      break
+    fi
+  done
+  $covered && return 0
+  printf '%s\n' "$path"
+}
+
+# Linked git worktrees often have a .git file whose gitdir points outside the
+# worktree. When the worktree itself is the only Docker bind mount, git cannot
+# reach that metadata and OpenCode falls back to a global project id. Print the
+# minimal extra metadata directories that must be mounted read-write at the same
+# absolute container path.
+opencode_git_metadata_mount_paths() {
+  local workspace="$1" start_dir="$2"
+  local workspace_resolved start_dir_resolved gitdir_raw gitdir commondir=""
+  local required=() mounts=() reduced=() candidate existing
+
+  workspace_resolved="$(resolve_path "$workspace")"
+  start_dir_resolved="$(resolve_existing_dir "$start_dir")" || return 0
+  [[ -f "$start_dir_resolved/.git" && ! -L "$start_dir_resolved/.git" ]] || return 0
+
+  gitdir_raw="$(read_gitdir_from_git_file "$start_dir_resolved/.git")" || return 0
+  gitdir="$(resolve_git_metadata_path "$start_dir_resolved" "$gitdir_raw" 2>/dev/null)" || return 0
+  valid_gitdir_metadata_dir "$gitdir" || return 0
+
+  if commondir="$(read_common_git_dir "$gitdir")"; then
+    gitdir_backlink_matches_start_git_file "$gitdir" "$start_dir_resolved/.git" || return 0
+    valid_common_git_metadata_dir "$commondir" || return 0
+    path_is_at_or_under "$gitdir" "$commondir" || return 0
+    required=("$commondir")
+  elif gitdir_core_worktree_matches_start_dir "$gitdir" "$start_dir_resolved"; then
+    required=("$gitdir")
+  else
+    return 0
+  fi
+
+  for candidate in "${required[@]}"; do
+    candidate="$(resolve_path "$candidate")"
+    candidate="$(opencode_append_extra_mount_path "$workspace_resolved" "$candidate" "${mounts[@]}")"
+    [[ -n "$candidate" ]] || continue
+
+    reduced=()
+    for existing in "${mounts[@]}"; do
+      path_is_at_or_under "$existing" "$candidate" && continue
+      reduced+=("$existing")
+    done
+    mounts=("${reduced[@]}" "$candidate")
+  done
+
+  ((${#mounts[@]} == 0)) || printf '%s\n' "${mounts[@]}"
+}
+
+opencode_git_metadata_mount_args() {
+  local path
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    printf '%s\n' -v "$path:$path"
+  done < <(opencode_git_metadata_mount_paths "$1" "$2")
+}
+
 # Check whether the container with the given name is currently running.
 container_running() {
   [[ -n $(docker ps -q --filter "name=^${1}$") ]]
@@ -308,11 +524,28 @@ container_has_readonly_bind_mount_from() {
   return 1
 }
 
+# Check whether an existing container has a read-write bind mount from the
+# expected host source at the given destination.
+container_has_readwrite_bind_mount_from() {
+  local cname="$1" destination="$2" expected_source="$3"
+  local expected_source_resolved mounts type source mount_destination rw
+  expected_source_resolved="$(resolve_path "$expected_source")"
+  mounts="$(docker inspect --format '{{ range .Mounts }}{{ .Type }}{{ "\t" }}{{ .Source }}{{ "\t" }}{{ .Destination }}{{ "\t" }}{{ .RW }}{{ "\n" }}{{ end }}' "$cname" 2>/dev/null || true)"
+
+  while IFS=$'\t' read -r type source mount_destination rw; do
+    if [[ "$type" == "bind" && "$mount_destination" == "$destination" && "$rw" == "true" &&
+          ( "$source" == "$expected_source" || "$source" == "$expected_source_resolved" ) ]]; then
+      return 0
+    fi
+  done <<< "$mounts"
+  return 1
+}
+
 # OpenCode credentials and AIND config live in mode-specific bind mounts.
 # Existing containers created before OpenCode support may not have them, so fail
 # before attaching.
 ensure_opencode_mounts() {
-  local cname="$1" workspace="$2" missing=()
+  local cname="$1" workspace="$2" start_dir="${3:-$2}" missing=() git_metadata_mount
   container_has_bind_mount "$cname" "/home/node/.config/opencode" \
     || missing+=("/home/node/.config/opencode")
   container_has_bind_mount "$cname" "/home/node/.local/share/opencode" \
@@ -323,6 +556,12 @@ ensure_opencode_mounts() {
     || missing+=("/home/node/.local/state/opencode")
   container_has_readonly_bind_mount_from "$cname" "/etc/opencode/opencode.jsonc" "$TOKENS_DIR/opencode.jsonc" \
     || missing+=("/etc/opencode/opencode.jsonc (read-only from $TOKENS_DIR/opencode.jsonc)")
+
+  while IFS= read -r git_metadata_mount; do
+    [[ -n "$git_metadata_mount" ]] || continue
+    container_has_readwrite_bind_mount_from "$cname" "$git_metadata_mount" "$git_metadata_mount" \
+      || missing+=("$git_metadata_mount (read-write git metadata)")
+  done < <(opencode_git_metadata_mount_paths "$workspace" "$start_dir")
 
   if [[ ${#missing[@]} -gt 0 ]]; then
     err "Container '$cname' is missing or has invalid OpenCode bind mount(s): ${missing[*]}. Remove and recreate it with: aind rm --opencode '$workspace' && aind start --opencode '$workspace'"
@@ -796,7 +1035,7 @@ cmd_start() {
   if container_exists "$cname"; then
     ensure_container_mode "$cname" "$mode"
     if [[ "$mode" == "opencode" ]]; then
-      ensure_opencode_mounts "$cname" "$workspace"
+      ensure_opencode_mounts "$cname" "$workspace" "$start_dir"
     fi
     exists=true
   fi
@@ -818,6 +1057,7 @@ cmd_start() {
     #   opencode: ~/.config/opencode, ~/.local/share/opencode, and
     #     AIND's shared OpenCode config mounted read-only under /etc/opencode.
     local config_mounts=()
+    local git_metadata_mounts=() git_metadata_mount
     case "$mode" in
       copilot)
         config_mounts=(
@@ -840,7 +1080,12 @@ cmd_start() {
           -v "$HOME/.cache/opencode:/home/node/.cache/opencode"
           -v "$HOME/.local/state/opencode:/home/node/.local/state/opencode"
           -v "$opencode_config:/etc/opencode/opencode.jsonc:ro"
-        ) ;;
+        )
+        while IFS= read -r git_metadata_mount; do
+          [[ -n "$git_metadata_mount" ]] || continue
+          git_metadata_mounts+=("$git_metadata_mount")
+        done < <(opencode_git_metadata_mount_args "$workspace" "$start_dir")
+        ;;
       *)
         local settings_local="$TOKENS_DIR/${cname}.claude_settings_local.json"
         [[ -f "$settings_local" ]] || echo '{}' > "$settings_local"
@@ -888,6 +1133,7 @@ cmd_start() {
       -e GIT_COMMITTER_NAME="$(case "$mode" in copilot) echo 'GitHub Copilot';; gemini) echo 'Gemini CLI';; opencode) echo 'OpenCode';; *) echo 'Claude Code';; esac)" \
       -e GIT_COMMITTER_EMAIL="$(case "$mode" in copilot) echo 'noreply@github.com';; gemini) echo 'noreply@google.com';; opencode) echo 'noreply@opencode.ai';; *) echo 'noreply@anthropic.com';; esac)" \
       "${config_mounts[@]}" \
+      "${git_metadata_mounts[@]}" \
       -v "$workspace:$workspace" \
       --workdir "$workspace" \
       "$IMAGE_NAME" \
