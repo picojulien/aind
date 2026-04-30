@@ -124,3 +124,118 @@ start_dash_dir="$(validate_opencode_start_dir "$TMP_DIR/real/a" "./-bad")"
 assert_eq "$TMP_DIR/real/a/-bad" "$start_dash_dir" "equals cwd can target dash-prefixed directory"
 
 expect_failure "symlink cwd escape is rejected" "resolves outside the workspace" validate_opencode_start_dir "$TMP_DIR/root" out
+
+mkdir -p "$TMP_DIR/git-parent/.git/objects" "$TMP_DIR/git-parent/.git/worktrees/leaf" "$TMP_DIR/git-parent/sub/worktree"
+printf 'gitdir: %s\n' "$TMP_DIR/git-parent/.git/worktrees/leaf" > "$TMP_DIR/git-parent/sub/worktree/.git"
+printf '../..\n' > "$TMP_DIR/git-parent/.git/worktrees/leaf/commondir"
+printf '%s\n' "$TMP_DIR/git-parent/sub/worktree/.git" > "$TMP_DIR/git-parent/.git/worktrees/leaf/gitdir"
+
+direct_git_mounts="$(opencode_git_metadata_mount_paths "$TMP_DIR/git-parent/sub/worktree" "$TMP_DIR/git-parent/sub/worktree")"
+assert_eq "$TMP_DIR/git-parent/.git" "$direct_git_mounts" "direct linked worktree mounts common git metadata"
+
+direct_git_mount_args="$(opencode_git_metadata_mount_args "$TMP_DIR/git-parent/sub/worktree" "$TMP_DIR/git-parent/sub/worktree")"
+assert_eq $'-v\n'"$TMP_DIR/git-parent/.git:$TMP_DIR/git-parent/.git" "$direct_git_mount_args" "direct linked worktree uses read-write same-path docker mount"
+
+parent_git_mounts="$(opencode_git_metadata_mount_paths "$TMP_DIR/git-parent" "$TMP_DIR/git-parent/sub/worktree")"
+assert_eq "" "$parent_git_mounts" "parent workspace does not duplicate covered git metadata mount"
+
+mkdir -p "$TMP_DIR/git-relative/.git/objects" "$TMP_DIR/git-relative/.git/worktrees/leaf" "$TMP_DIR/git-relative/worktree"
+printf 'gitdir: ../.git/worktrees/leaf\n' > "$TMP_DIR/git-relative/worktree/.git"
+printf '../..\n' > "$TMP_DIR/git-relative/.git/worktrees/leaf/commondir"
+printf '../../../worktree/.git\n' > "$TMP_DIR/git-relative/.git/worktrees/leaf/gitdir"
+
+relative_git_mounts="$(opencode_git_metadata_mount_paths "$TMP_DIR/git-relative/worktree" "$TMP_DIR/git-relative/worktree")"
+assert_eq "$TMP_DIR/git-relative/.git" "$relative_git_mounts" "relative linked worktree gitdir resolves to common metadata mount"
+
+mkdir -p "$TMP_DIR/git-no-backlink/.git/objects" "$TMP_DIR/git-no-backlink/.git/worktrees/leaf" "$TMP_DIR/git-no-backlink/worktree"
+printf 'gitdir: %s\n' "$TMP_DIR/git-no-backlink/.git/worktrees/leaf" > "$TMP_DIR/git-no-backlink/worktree/.git"
+printf '../..\n' > "$TMP_DIR/git-no-backlink/.git/worktrees/leaf/commondir"
+no_backlink_mounts="$(opencode_git_metadata_mount_paths "$TMP_DIR/git-no-backlink/worktree" "$TMP_DIR/git-no-backlink/worktree")"
+assert_eq "" "$no_backlink_mounts" "linked worktree without gitdir backlink gets no metadata mount"
+
+mkdir -p "$TMP_DIR/git-wrong-backlink/.git/objects" "$TMP_DIR/git-wrong-backlink/.git/worktrees/leaf" "$TMP_DIR/git-wrong-backlink/worktree"
+printf 'gitdir: %s\n' "$TMP_DIR/git-wrong-backlink/.git/worktrees/leaf" > "$TMP_DIR/git-wrong-backlink/worktree/.git"
+printf '../..\n' > "$TMP_DIR/git-wrong-backlink/.git/worktrees/leaf/commondir"
+printf '%s\n' "$TMP_DIR/other-worktree/.git" > "$TMP_DIR/git-wrong-backlink/.git/worktrees/leaf/gitdir"
+wrong_backlink_mounts="$(opencode_git_metadata_mount_paths "$TMP_DIR/git-wrong-backlink/worktree" "$TMP_DIR/git-wrong-backlink/worktree")"
+assert_eq "" "$wrong_backlink_mounts" "linked worktree with wrong gitdir backlink gets no metadata mount"
+
+mkdir -p "$TMP_DIR/separate-gitdir/.git/modules/sub/objects" "$TMP_DIR/separate-worktree"
+printf 'gitdir: %s\n' "$TMP_DIR/separate-gitdir/.git/modules/sub" > "$TMP_DIR/separate-worktree/.git"
+printf 'ref: refs/heads/main\n' > "$TMP_DIR/separate-gitdir/.git/modules/sub/HEAD"
+printf '[core]\n\tworktree = %s\n' "$TMP_DIR/separate-worktree" > "$TMP_DIR/separate-gitdir/.git/modules/sub/config"
+separate_gitdir_mounts="$(opencode_git_metadata_mount_paths "$TMP_DIR/separate-worktree" "$TMP_DIR/separate-worktree")"
+assert_eq "$TMP_DIR/separate-gitdir/.git/modules/sub" "$separate_gitdir_mounts" "separate gitdir with matching core.worktree mounts minimal metadata"
+
+mkdir -p "$TMP_DIR/normal-repo/.git"
+normal_git_mounts="$(opencode_git_metadata_mount_paths "$TMP_DIR/normal-repo" "$TMP_DIR/normal-repo")"
+assert_eq "" "$normal_git_mounts" "normal repo with in-workspace .git directory needs no metadata mount"
+
+mkdir -p "$TMP_DIR/not-git"
+non_git_mounts="$(opencode_git_metadata_mount_paths "$TMP_DIR/not-git" "$TMP_DIR/not-git")"
+assert_eq "" "$non_git_mounts" "non-git directory needs no metadata mount"
+
+mkdir -p "$TMP_DIR/malicious-worktree" "$TMP_DIR/outside-home"
+printf 'gitdir: %s\n' "$TMP_DIR/outside-home" > "$TMP_DIR/malicious-worktree/.git"
+malicious_git_mounts="$(opencode_git_metadata_mount_paths "$TMP_DIR/malicious-worktree" "$TMP_DIR/malicious-worktree")"
+assert_eq "" "$malicious_git_mounts" "bogus outside gitdir target gets no metadata mount"
+
+mkdir -p "$TMP_DIR/unrelated-worktree" "$TMP_DIR/external-repo/.git/objects"
+printf 'gitdir: %s\n' "$TMP_DIR/external-repo/.git" > "$TMP_DIR/unrelated-worktree/.git"
+printf 'ref: refs/heads/main\n' > "$TMP_DIR/external-repo/.git/HEAD"
+printf '[core]\n\trepositoryformatversion = 0\n' > "$TMP_DIR/external-repo/.git/config"
+unrelated_git_mounts="$(opencode_git_metadata_mount_paths "$TMP_DIR/unrelated-worktree" "$TMP_DIR/unrelated-worktree")"
+assert_eq "" "$unrelated_git_mounts" "plausible unrelated external gitdir gets no metadata mount"
+
+mkdir -p "$TMP_DIR/fake-local-worktree/local-gitdir" "$TMP_DIR/external-common/.git/objects"
+printf 'gitdir: local-gitdir\n' > "$TMP_DIR/fake-local-worktree/.git"
+printf 'ref: refs/heads/main\n' > "$TMP_DIR/fake-local-worktree/local-gitdir/HEAD"
+printf '%s\n' "$TMP_DIR/fake-local-worktree/.git" > "$TMP_DIR/fake-local-worktree/local-gitdir/gitdir"
+printf '%s\n' "$TMP_DIR/external-common/.git" > "$TMP_DIR/fake-local-worktree/local-gitdir/commondir"
+printf 'ref: refs/heads/main\n' > "$TMP_DIR/external-common/.git/HEAD"
+printf '[core]\n\trepositoryformatversion = 0\n' > "$TMP_DIR/external-common/.git/config"
+fake_local_common_mounts="$(opencode_git_metadata_mount_paths "$TMP_DIR/fake-local-worktree" "$TMP_DIR/fake-local-worktree")"
+assert_eq "" "$fake_local_common_mounts" "workspace-local fake gitdir cannot mount unrelated external commondir"
+
+mkdir -p "$TMP_DIR/symlink-target/.git/objects" "$TMP_DIR/symlink-target/.git/worktrees/leaf" "$TMP_DIR/symlink-target/worktree" "$TMP_DIR/symlink-git-worktree"
+printf 'gitdir: %s\n' "$TMP_DIR/symlink-target/.git/worktrees/leaf" > "$TMP_DIR/symlink-target/worktree/.git"
+printf '../..\n' > "$TMP_DIR/symlink-target/.git/worktrees/leaf/commondir"
+printf '%s\n' "$TMP_DIR/symlink-target/worktree/.git" > "$TMP_DIR/symlink-target/.git/worktrees/leaf/gitdir"
+ln -s "$TMP_DIR/symlink-target/worktree/.git" "$TMP_DIR/symlink-git-worktree/.git"
+symlink_git_mounts="$(opencode_git_metadata_mount_paths "$TMP_DIR/symlink-git-worktree" "$TMP_DIR/symlink-git-worktree")"
+assert_eq "" "$symlink_git_mounts" "symlink .git file gets no metadata mount"
+
+(
+  TOKENS_DIR="$TMP_DIR/tokens"
+  mkdir -p "$TOKENS_DIR"
+  : > "$TOKENS_DIR/opencode.jsonc"
+
+  # Invoked indirectly by ensure_opencode_mounts.
+  # shellcheck disable=SC2329
+  docker() {
+    if [[ "${1:-}" != "inspect" || "${2:-}" != "--format" ]]; then
+      return 1
+    fi
+
+    case "${3:-}" in
+      *'.Type }} {{ .Destination }}'*)
+        printf '%s\n' \
+          'bind /home/node/.config/opencode' \
+          'bind /home/node/.local/share/opencode' \
+          'bind /home/node/.cache/opencode' \
+          'bind /home/node/.local/state/opencode' \
+          'bind /etc/opencode/opencode.jsonc'
+        ;;
+      *'.Type }}{{ "\t" }}'*)
+        printf 'bind\t%s\t/etc/opencode/opencode.jsonc\tfalse\n' "$TOKENS_DIR/opencode.jsonc"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  }
+
+  expect_failure "existing OpenCode direct worktree requires git metadata mount" \
+    "$TMP_DIR/git-parent/.git" \
+    ensure_opencode_mounts "aind-test" "$TMP_DIR/git-parent/sub/worktree" "$TMP_DIR/git-parent/sub/worktree"
+)
