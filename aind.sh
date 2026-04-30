@@ -66,6 +66,8 @@
 #                     this carefully — never use $HOME as the workspace or you
 #                     expose your entire home directory including SSH keys,
 #                     .env files, and other secrets.
+#                     In OpenCode mode, --cwd/-cwd starts OpenCode in an existing
+#                     subdirectory while keeping this mount as the workspace root.
 #
 # Network: the container has unrestricted outbound internet access, so any of
 # the data listed above can be exfiltrated by a malicious tool or dependency.
@@ -92,17 +94,57 @@ sha256_cmd() {
 
 # realpath is GNU coreutils; not available by default on macOS.
 # Fall back to readlink -f (also GNU, but present on more systems),
-# then to a pure-bash resolution that handles relative paths without
-# resolving symlinks.
+# then to a pure-bash resolution that canonicalizes the existing path or nearest
+# existing parent while preserving missing leaf creation.
 resolve_path() {
   if command -v realpath >/dev/null 2>&1; then
     realpath "$1"
   elif readlink -f "$1" >/dev/null 2>&1; then
     readlink -f "$1"
   else
-    local path="$1"
+    local path="$1" parent leaf resolved suffix=""
     [[ "$path" == /* ]] || path="$PWD/$path"
-    echo "$path"
+
+    if [[ -d "$path" ]]; then
+      (cd -- "$path" && pwd -P)
+      return 0
+    fi
+
+    if [[ -e "$path" ]]; then
+      parent="${path%/*}"
+      leaf="${path##*/}"
+      [[ "$parent" != "$path" && -n "$parent" ]] || parent="/"
+      resolved="$(cd -- "$parent" && pwd -P)"
+      if [[ "$resolved" == "/" ]]; then
+        printf '/%s\n' "$leaf"
+      else
+        printf '%s/%s\n' "$resolved" "$leaf"
+      fi
+      return 0
+    fi
+
+    parent="$path"
+    while [[ "$parent" != "/" && ! -d "$parent" ]]; do
+      leaf="${parent##*/}"
+      suffix="${leaf}${suffix:+/$suffix}"
+      parent="${parent%/*}"
+      [[ -n "$parent" ]] || parent="/"
+    done
+
+    if [[ -d "$parent" ]]; then
+      resolved="$(cd -- "$parent" && pwd -P)"
+      if [[ -n "$suffix" ]]; then
+        if [[ "$resolved" == "/" ]]; then
+          printf '/%s\n' "$suffix"
+        else
+          printf '%s/%s\n' "$resolved" "$suffix"
+        fi
+      else
+        printf '%s\n' "$resolved"
+      fi
+    else
+      printf '%s\n' "$path"
+    fi
   fi
 }
 
@@ -131,20 +173,87 @@ container_name() {
   echo "${CONTAINER_PREFIX}${workspace}" | tr '/' '-'
 }
 
-# Parse mode flag and optional workspace path from arguments.
-# Outputs two space-separated fields: <claude|copilot|gemini|opencode> <workspace_or_empty>
-# Usage: read -r mode workspace_arg <<< "$(parse_args "$@")"
+# Parse mode flag, optional --cwd/-cwd, and optional workspace path from arguments.
+# Sets PARSED_MODE, PARSED_CWD, and PARSED_WORKSPACE.
 parse_args() {
-  local mode="claude" workspace=""
-  for arg in "$@"; do
-    case "$arg" in
-      --copilot) mode="copilot" ;;
-      --gemini)  mode="gemini" ;;
-      --opencode) mode="opencode" ;;
-      *)         workspace="$arg" ;;
+  PARSED_MODE="claude"
+  PARSED_CWD=""
+  PARSED_WORKSPACE=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --copilot) PARSED_MODE="copilot"; shift ;;
+      --gemini)  PARSED_MODE="gemini"; shift ;;
+      --opencode) PARSED_MODE="opencode"; shift ;;
+      --cwd|-cwd)
+        [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != -* ]] \
+          || err "--cwd/-cwd requires a relative OpenCode start subdirectory."
+        PARSED_CWD="$2"
+        shift 2
+        ;;
+      --cwd=*|-cwd=*)
+        PARSED_CWD="${1#*=}"
+        [[ -n "$PARSED_CWD" ]] \
+          || err "--cwd/-cwd requires a relative OpenCode start subdirectory."
+        shift
+        ;;
+      --*)
+        err "Unknown option: $1"
+        ;;
+      -*)
+        err "Unknown option: $1"
+        ;;
+      *)
+        PARSED_WORKSPACE="$1"
+        shift
+        ;;
     esac
   done
-  echo "$mode" "$workspace"
+
+  if [[ -n "$PARSED_CWD" && "$PARSED_MODE" != "opencode" ]]; then
+    err "--cwd/-cwd can only be used with --opencode."
+  fi
+}
+
+# Resolve an existing directory physically, following symlinks.
+resolve_existing_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 1
+  (cd -- "$dir" && pwd -P)
+}
+
+# Validate that OpenCode starts in an existing relative subdirectory inside the
+# mounted workspace. Prints the resolved start directory.
+validate_opencode_start_dir() {
+  local workspace="$1" cwd="${2:-}" workspace_resolved start_dir
+  if [[ -z "$cwd" ]]; then
+    if start_dir="$(resolve_existing_dir "$workspace")"; then
+      printf '%s\n' "$start_dir"
+    else
+      printf '%s\n' "$workspace"
+    fi
+    return 0
+  fi
+
+  [[ "$cwd" != /* ]] \
+    || err "--cwd/-cwd must be relative, not absolute: $cwd"
+
+  if ! workspace_resolved="$(resolve_existing_dir "$workspace")"; then
+    err "OpenCode workspace must exist and be a directory when --cwd/-cwd is used: $workspace"
+  fi
+  if ! start_dir="$(resolve_existing_dir "$workspace_resolved/$cwd")"; then
+    err "--cwd/-cwd must be an existing directory under the workspace: $cwd"
+  fi
+
+  if [[ "$workspace_resolved" == "/" ]]; then
+    printf '%s\n' "$start_dir"
+    return 0
+  fi
+
+  case "$start_dir" in
+    "$workspace_resolved"|"$workspace_resolved"/*) printf '%s\n' "$start_dir" ;;
+    *) err "--cwd/-cwd resolves outside the workspace: $cwd" ;;
+  esac
 }
 
 # Check whether the container with the given name is currently running.
@@ -229,17 +338,18 @@ opencode_builtin_agent_names() {
 }
 
 opencode_discovered_agent_names() {
-  local workspace="${1:-}" dir path name
+  local workspace dir path name
   local dirs=(
     "$HOME/.config/opencode/agents"
     "$HOME/.config/opencode/agent"
   )
-  if [[ -n "$workspace" ]]; then
+  for workspace in "$@"; do
+    [[ -n "$workspace" ]] || continue
     dirs+=(
       "$workspace/.opencode/agents"
       "$workspace/.opencode/agent"
     )
-  fi
+  done
 
   for dir in "${dirs[@]}"; do
     [[ -d "$dir" ]] || continue
@@ -254,8 +364,7 @@ opencode_discovered_agent_names() {
 }
 
 opencode_agent_names() {
-  local workspace="${1:-}"
-  { opencode_builtin_agent_names; opencode_discovered_agent_names "$workspace"; } | LC_ALL=C sort -u
+  { opencode_builtin_agent_names; opencode_discovered_agent_names "$@"; } | LC_ALL=C sort -u
 }
 
 opencode_json_string() {
@@ -268,8 +377,13 @@ opencode_json_string() {
   printf '"%s"' "$value"
 }
 
+opencode_workspace_id_for_start_dir() {
+  local start_dir="$1"
+  printf 'ws-%s\n' "$(printf '%s\n' "$start_dir" | sha256_cmd | cut -c1-32)"
+}
+
 opencode_default_config_template() {
-  local workspace="${1:-}" agent first=true
+  local agent first=true
   cat <<'EOF'
 {
   "$schema": "https://opencode.ai/config.json",
@@ -288,7 +402,7 @@ EOF
     printf '    '
     opencode_json_string "$agent"
     printf ': {\n      "permission": {\n        "*": "allow"\n      }\n    }'
-  done < <(opencode_agent_names "$workspace")
+  done < <(opencode_agent_names "$@")
   cat <<'EOF'
 
   }
@@ -338,14 +452,14 @@ EOF
 }
 
 ensure_opencode_config() {
-  local workspace="${1:-}" config="$TOKENS_DIR/opencode.jsonc"
+  local config="$TOKENS_DIR/opencode.jsonc"
   [[ -e "$config" && ! -f "$config" ]] \
     && err "OpenCode config path exists but is not a file: $config"
   if [[ ! -f "$config" ]]; then
-    opencode_default_config_template "$workspace" > "$config"
+    opencode_default_config_template "$@" > "$config"
     chmod 600 "$config"
   elif opencode_config_is_legacy "$config" || opencode_config_is_bad_permission_template "$config"; then
-    opencode_default_config_template "$workspace" > "$config"
+    opencode_default_config_template "$@" > "$config"
     chmod 600 "$config"
   else
     log "OpenCode config exists at $config; custom edits preserved. For yolo mode, use permission: {\"*\":\"allow\"} and agent entries with permission: {\"*\":\"allow\"}."
@@ -664,15 +778,18 @@ read_gitlab_token() {
 #   - To pick up a new image build, remove the container first:
 #       docker rm <container-name>
 cmd_start() {
-  read -r mode workspace_arg <<< "$(parse_args "$@")"
+  parse_args "$@"
+  local mode="$PARSED_MODE" cwd="$PARSED_CWD" workspace_arg="$PARSED_WORKSPACE"
   local workspace
   workspace="$(resolve_path "${workspace_arg:-$PWD}")"
+  local start_dir="$workspace"
   local cname
   cname="$(container_name "$workspace")"
 
   if [[ "$mode" == "opencode" ]]; then
+    start_dir="$(validate_opencode_start_dir "$workspace" "$cwd")"
     mkdir -p "$TOKENS_DIR"
-    ensure_opencode_config "$workspace"
+    ensure_opencode_config "$workspace" "$start_dir"
   fi
 
   local exists=false
@@ -736,7 +853,7 @@ cmd_start() {
 
     log "Starting container '$cname' (workspace: $workspace)..."
     # USER_UID/USER_GID: passed to the entrypoint so it can remap the node user.
-    # WORKSPACE: made available inside the container so tmux can cd into it.
+    # WORKSPACE: mounted workspace root, available inside the container.
     # GIT_*: set the git identity for all commits made by the AI tool.
     # GH_TOKEN/GITLAB_TOKEN: injected at exec time (not run time) so a
     #   stop/start cycle picks up updated token files without needing docker rm.
@@ -838,17 +955,21 @@ cmd_start() {
     -e LANG="${LANG:-C.UTF-8}"
     -e LC_ALL="${LC_ALL:-C.UTF-8}"
     -e HOME=/home/node
+    -e WORKSPACE="$workspace"
+    -e AIND_START_DIR="$start_dir"
     -e GH_TOKEN="$gh_token"
     -e GITLAB_TOKEN="$gitlab_token"
   )
   if [[ "$mode" == "opencode" ]]; then
     # OpenCode scopes sessions by a random workspace_id generated at server start.
-    # We pin it to a deterministic hash of the workspace path so the same path
-    # always gets the same workspace_id — both inside and outside the container.
+    # We pin it to a deterministic hash of the OpenCode start directory so the
+    # same directory always gets the same workspace_id — both inside and outside
+    # the container.
     # To see the same sessions on the host, export the value printed below.
     local opencode_workspace_id
-    opencode_workspace_id="ws-$(echo "$workspace" | sha256_cmd | cut -c1-32)"
-    log "OpenCode workspace ID: $opencode_workspace_id"
+    opencode_workspace_id="$(opencode_workspace_id_for_start_dir "$start_dir")"
+    log "OpenCode start directory: $start_dir"
+    log "OpenCode workspace ID for start directory: $opencode_workspace_id"
     log "  → to share sessions with the host, run on the host:"
     log "      export OPENCODE_WORKSPACE_ID=$opencode_workspace_id"
 
@@ -865,12 +986,13 @@ cmd_start() {
 
   # Forward terminal settings so the UI renders correctly inside the container.
   # Double-quoting the bash -c string lets the host shell expand $tmux_cmd now,
-  # while \$WORKSPACE is deferred to the container's bash via the escaped $.
+  # while \$AIND_START_DIR is deferred to the container's bash via the escaped $.
   docker exec -it --user node \
     "${exec_env[@]}" \
     "$cname" bash -c "
+    : \"\${AIND_START_DIR:=\$WORKSPACE}\"
     if ! tmux has-session -t main 2>/dev/null; then
-      tmux_env=()
+      tmux_env=( -e \"WORKSPACE=\$WORKSPACE\" -e \"AIND_START_DIR=\$AIND_START_DIR\" )
       if [[ -n \"\${OPENCODE_WORKSPACE_ID:-}\" ]]; then
         # Pass OpenCode env through tmux so new sessions receive it even if a
         # tmux server already exists with older environment state.
@@ -882,10 +1004,10 @@ cmd_start() {
         tmux_env+=( -e \"OPENCODE_EXPERIMENTAL_LSP_TOOL=\$OPENCODE_EXPERIMENTAL_LSP_TOOL\" )
         tmux_env+=( -e \"OPENCODE_WORKSPACE_ID=\$OPENCODE_WORKSPACE_ID\" )
       fi
-      tmux new-session -s main -c \"\$WORKSPACE\" \"\${tmux_env[@]}\" \"${tmux_cmd}\"
+      tmux new-session -s main -c \"\$AIND_START_DIR\" \"\${tmux_env[@]}\" \"${tmux_cmd}\"
     else
       if [[ -n \"\${OPENCODE_WORKSPACE_ID:-}\" ]]; then
-        printf '[aind] OpenCode tmux session already exists; exit or kill it, then re-run aind, to pick up OpenCode environment/config changes.\\n' >&2
+        printf '[aind] OpenCode tmux session already exists; exit or kill it, then re-run aind, to pick up start directory, workspace ID, or config changes.\\n' >&2
       fi
       tmux attach -t main
     fi
@@ -896,7 +1018,8 @@ cmd_start() {
 # writable layer (installed packages, etc.) survives and is reused on the next
 # start. To fully remove the container use the rm command.
 cmd_stop() {
-  read -r _mode workspace_arg <<< "$(parse_args "$@")"
+  parse_args "$@"
+  local workspace_arg="$PARSED_WORKSPACE"
   local workspace cname
   workspace="$(resolve_path "${workspace_arg:-$PWD}")"
   cname="$(container_name "$workspace")"
@@ -912,7 +1035,8 @@ cmd_stop() {
 # because the entire writable layer (including any dockerd state) is discarded
 # anyway.
 cmd_rm() {
-  read -r _mode workspace_arg <<< "$(parse_args "$@")"
+  parse_args "$@"
+  local workspace_arg="$PARSED_WORKSPACE"
   local workspace cname
   workspace="$(resolve_path "${workspace_arg:-$PWD}")"
   cname="$(container_name "$workspace")"
@@ -926,7 +1050,8 @@ cmd_version() {
 }
 
 cmd_status() {
-  read -r _mode workspace_arg <<< "$(parse_args "$@")"
+  parse_args "$@"
+  local workspace_arg="$PARSED_WORKSPACE"
   if [[ -z "$workspace_arg" ]]; then
     docker ps -a --filter "name=^${CONTAINER_PREFIX}"
   else
@@ -937,7 +1062,8 @@ cmd_status() {
 }
 
 cmd_logs() {
-  read -r _mode workspace_arg <<< "$(parse_args "$@")"
+  parse_args "$@"
+  local workspace_arg="$PARSED_WORKSPACE"
   local workspace cname
   workspace="$(resolve_path "${workspace_arg:-$PWD}")"
   cname="$(container_name "$workspace")"
@@ -945,6 +1071,12 @@ cmd_logs() {
 }
 
 cmd_restart() {
+  parse_args "$@"
+  if [[ "$PARSED_MODE" == "opencode" ]]; then
+    local workspace
+    workspace="$(resolve_path "${PARSED_WORKSPACE:-$PWD}")"
+    validate_opencode_start_dir "$workspace" "$PARSED_CWD" >/dev/null
+  fi
   cmd_stop "$@"
   cmd_start "$@"
 }
@@ -952,21 +1084,35 @@ cmd_restart() {
 # -- dispatch -----------------------------------------------------------------
 
 usage() {
-  echo "Usage: $0 {build [--force]|start|stop|restart|rm|status|logs|version} [--copilot|--gemini|--opencode] [workspace]"
+  echo "Usage: $0 {build [--force]|start|stop|restart|rm|status|logs|version|help} [--copilot|--gemini|--opencode] [--cwd|-cwd <relative-subdir>] [workspace]"
   echo
   echo "  build   [--force]                        Rebuild image if embedded content changed (--force always rebuilds)"
-  echo "  start   [--copilot|--gemini|--opencode] [workspace] Attach to session or start a new one (default: \$PWD)"
+  echo "  start   [--copilot|--gemini|--opencode] [--cwd|-cwd <relative-subdir>] [workspace] Attach to session or start a new one (default: \$PWD)"
   echo "  stop    [--copilot|--gemini|--opencode] [workspace] Stop the container, preserving its state (default: \$PWD)"
-  echo "  restart [--copilot|--gemini|--opencode] [workspace] Stop then start the container (default: \$PWD)"
+  echo "  restart [--copilot|--gemini|--opencode] [--cwd|-cwd <relative-subdir>] [workspace] Stop then start the container (default: \$PWD)"
   echo "  rm      [--copilot|--gemini|--opencode] [workspace] Remove the container (default: \$PWD)"
   echo "  status  [--copilot|--gemini|--opencode] [workspace] Show container status; no arg lists all (default: \$PWD)"
   echo "  logs    [--copilot|--gemini|--opencode] [workspace] Tail container logs (default: \$PWD)"
   echo "  version                                  Print the script version"
+  echo "  help                                     Print this help message"
   echo
-  echo "  --copilot   Use GitHub Copilot instead of Claude."
-  echo "  --gemini    Use Gemini CLI instead of Claude."
-  echo "  --opencode  Use OpenCode instead of Claude."
+  echo "  --copilot                       Use GitHub Copilot instead of Claude."
+  echo "  --gemini                        Use Gemini CLI instead of Claude."
+  echo "  --opencode                      Use OpenCode instead of Claude."
+  echo "  --cwd, -cwd <relative-subdir>    In --opencode mode, start OpenCode in an existing relative workspace subdirectory."
+  echo "  --cwd=..., -cwd=...              Same as above; mount root and container name still use [workspace]."
 }
+
+if [[ "${AIND_SOURCE_ONLY:-}" == "1" ]]; then
+  if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+  fi
+  exit 0
+fi
+
+case "${1:-}" in
+  --help|-h|help) usage; exit 0 ;;
+esac
 
 check_deps
 
